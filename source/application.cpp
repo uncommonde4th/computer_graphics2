@@ -1,4 +1,6 @@
 #include "application.hpp"
+#include "glm/ext/vector_float3.hpp"
+#include "glm/ext/vector_float4.hpp"
 #include "graphics_internal.hpp"
 #include "vulkan/vulkan_core.h"
 
@@ -12,26 +14,57 @@
 #include <iostream>
 #include <vector>
 
+#define GLM_FORCE_RADIANS
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE
+
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
+
 namespace application {
 
 struct Vertex {
   float position[3];
-  float color[3];
+  float normal[3];
 };
 
-struct UniformBufferObject {
-  float position[4];
-  float rotation[4];
-  float scale[4];
-  float tint[4];
-  float camera[4];
+struct SceneUniform {
+  glm::mat4 viewProjection;
+  glm::vec4 cameraPosition;
+  glm::vec4 ambient;
+  glm::vec4 sunDirection;
+  glm::vec4 sunColor;
+  glm::ivec4 counts;
+};
+
+struct PointLight {
+  glm::vec4 position;
+  glm::vec4 color;
+};
+
+struct SpotLight {
+  glm::vec4 position;
+  glm::vec4 direction;
+  glm::vec4 color;
+  glm::vec4 cone;
+};
+
+struct ModelUniform {
+  glm::mat4 model;
+  glm::mat4 normalMatrix;
+  glm::vec4 albedo;
+  glm::vec4 specular;
 };
 
 struct RenderObject {
-  float position[3];
-  float rotationDeg[3];
-  float scale[3];
-  float tint[3];
+  glm::vec3 position;
+  glm::vec3 rotationDeg;
+  glm::vec3 scale;
+  bool animated;
+
+  glm::vec3 albedo;
+  glm::vec3 specularColor;
+  float shininess;
 
   VkBuffer uniformBuffer = VK_NULL_HANDLE;
   VmaAllocation uniformBufferAllocation = nullptr;
@@ -39,28 +72,46 @@ struct RenderObject {
   VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
 };
 
-std::array<RenderObject, 3> renderObjects{};
+std::array<RenderObject, 4> renderObjects{};
 
 std::vector<Vertex> vertices;
 std::vector<uint32_t> indices;
 
+// Камера
 bool perspective;
 float fovDeg;
 float orthoSize;
-float cameraDistance;
+glm::vec3 cameraPosition;
+float cameraYaw;
+float cameraPitch;
+
+// Освещение
+glm::vec3 ambientColor;
+float ambientIntensity;
+glm::vec3 sunDirection;
+glm::vec3 sunColor;
+float sunIntensity;
+
+std::vector<PointLight> pointLights;
+std::vector<SpotLight> spotLights;
+uint32_t maxLights;
 
 int selectedObject;
 
+// Анимация
 bool playing;
 float animTime;
 float animSpeed;
 float orbitRadius;
 float verticalAmplitude;
-float spinDegPerSec[3];
+glm::vec3 spinDegPerSec;
 
 VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
-VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
+VkDescriptorSetLayout sceneSetLayout = VK_NULL_HANDLE;
+VkDescriptorSetLayout modelSetLayout = VK_NULL_HANDLE;
 VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+VkDescriptorSet sceneDescriptorSet = VK_NULL_HANDLE;
+
 VkShaderModule vertexShader = VK_NULL_HANDLE;
 VkShaderModule fragmentShader = VK_NULL_HANDLE;
 VkPipeline graphicsPipeline = VK_NULL_HANDLE;
@@ -69,6 +120,14 @@ VkBuffer vertexBuffer = VK_NULL_HANDLE;
 VmaAllocation vertexBufferAllocation = nullptr;
 VkBuffer indexBuffer = VK_NULL_HANDLE;
 VmaAllocation indexBufferAllocation = nullptr;
+
+VkBuffer sceneBuffer = VK_NULL_HANDLE;
+VmaAllocation sceneBufferAllocation = nullptr;
+void* sceneBufferMemory = nullptr;
+
+VkBuffer pointLightBuffer = VK_NULL_HANDLE;
+VmaAllocation spotLightBufferAllocation = nullptr;
+void* spotLightBufferMemory = nullptr;
 
 // Читает скомпилированный шейдер .spv
 VkShaderModule loadShaderModule(const char path[]) {
@@ -129,70 +188,72 @@ bool createBuffer(const void* data, size_t size, VkBufferUsageFlags usage,
   return true;
 }
 
+// Память этого буфера остается отображенной
+bool createMappedBuffer(size_t size, VkBufferUsageFlags usage, VkBuffer& buffer,
+                        VmaAllocation& allocation, void*& memory) {
+  auto& context = graphics::internal::context;
+
+  VkBufferCreateInfo bufferInfo{
+      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+      .size = size,
+      .usage = usage,
+      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+  };
+
+  VmaAllocationCreateInfo allocationInfo{
+      .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+      .usage = VMA_MEMORY_USAGE_AUTO,
+  };
+
+  if (vmaCreateBuffer(context.allocator, &bufferInfo, &allocationInfo, &buffer,
+                      &allocation, nullptr) != VK_SUCCESS) {
+    return false;
+  }
+
+  return vmaMapMemory(context.allocator, allocation, &memory) == VK_SUCCESS;
+}
+
 // Строит параллелепипед
 void generateBoxGeometry() {
   vertices.clear();
   indices.clear();
 
-  vertices.reserve(8 + 2);
-  indices.reserve(4 * 12);
+  vertices.reserve(6 * 4);
+  indices.reserve(6 * 6);
 
-  constexpr uint32_t corners = 4;
-  constexpr float halfX = 0.75f;
-  constexpr float halfY = 0.5f;
-  constexpr float halfZ = 0.4f;
+  constexpr float halfSize[3] = {0.75f, 0.5f, 0, 4f};
 
-  for (uint32_t i = 0; i < corners; ++i) {
-    const float x = (i == 1 || i == 2) ? halfX : -halfX;
-    const float z = (i >= 2) ? halfZ : -halfZ;
+  constexpr float cornerU[4] = {-1.0f, 1.0f, 1.0f, -1.0f};
+  constexpr float cornerV[4] = {-1.0f, -1.0f, 1.0f, 1.0f};
 
-    vertices.push_back({
-        .position = {x, -halfY, z},
-        .color = {0.6f + 0.4f * x / halfX, 0.2f, 0.6f + 0.4f * z / halfZ},
-    });
+  for (int axis = 0; axis < 3; ++axis) {
+    const int u = (axis + 1) % 3;
+    const int v = (axis + 2) % 3;
 
-    vertices.push_back({
-        .position = {x, halfY, z},
-        .color = {0.6f + 0.4f * x / halfX, 1.0f, 0.6f + 0.4f * z / halfZ},
-    });
-  }
+    for (int side = 0; side < 2; ++side) {
+      const float sign = (side == 0) ? -1.0f : 1.0f;
+      const uint32_t first = static_cast<uint32_t>(vertices.size());
 
-  vertices.push_back({
-      .position = {0.0f, -halfY, 0.0f},
-      .color = {0.6f, 0.2f, 0.6f},
-  });
+      for (int corner = 0; corner < 4; ++corner) {
+        Vertex vertex{};
 
-  vertices.push_back({
-      .position = {0.0f, halfY, 0.0f},
-      .color = {0.6f, 1.0f, 0.6f},
-  });
+        vertex.position[axis] = sign * halfSize[axis];
+        vertex.position[u] = cornerU[corner] * halfSize[u];
+        vertex.position[v] = cornerV[corner] * halfSize[v];
 
-  const uint32_t bottomCenter = corners * 2;
-  const uint32_t topCenter = bottomCenter + 1;
+        vertex.normal[axis] = sign;
 
-  for (uint32_t i = 0; i < corners; ++i) {
-    const uint32_t next = (i + 1) % corners;
+        vertices.push_back(vertex);
+      }
 
-    const uint32_t bottom = i * 2;
-    const uint32_t top = bottom + 1;
-
-    const uint32_t nextBottom = next * 2;
-    const uint32_t nextTop = nextBottom + 1;
-
-    indices.insert(indices.end(), {
-                                      bottom,
-                                      top,
-                                      nextBottom,
-                                      nextBottom,
-                                      top,
-                                      nextTop,
-                                      bottomCenter,
-                                      bottom,
-                                      nextBottom,
-                                      topCenter,
-                                      nextTop,
-                                      top,
-                                  });
+      indices.insert(indices.end(), {
+                                        first,
+                                        first + 1,
+                                        first + 2,
+                                        first + 2,
+                                        first + 3,
+                                    });
+    }
   }
 }
 
@@ -201,8 +262,30 @@ bool initialize() {
 
   perspective = true;
   fovDeg = 60.0f;
-  orthoSize = 3.0f;
-  cameraDistance = 7.0f;
+  orthoSize = 4.0f;
+  cameraPosition = glm::vec3(0.0f, 2.5f, 8.0f);
+  cameraYaw = 0.0f;
+  cameraPitch = -15.0f;
+
+  ambientColor = glm::vec3(1.0f);
+  ambientIntensity = 0.1f;
+  sunDirection = glm::vec3(-0.3f, -1.0f, -0.4f);
+  sunColor = glm::vec3(1.0f);
+  sunIntensity = 0.5f;
+
+  maxLights = 16;
+
+  pointLights.push_back({
+      .position = glm::vec4(0.0f, 2.5f, 3.0f, 1.0f),
+      .color = glm::vec4(1.0f, 0.8f, 0.6f, 15.0f),
+  });
+
+  spotLights.push_back({
+      .position = glm::vec4(3.0f, 4.0f, 2.0f, 1.0f),
+      .direction = glm::vec4(-0.5f, -1.0f, -0.3f, 0.0f),
+      .color = glm::vec4(0.6f, 0.8f, 1.0f, 60.0f),
+      .cone = glm::vec4(15.0f, 25.0f, 0.0f, 0.0f),
+  });
 
   selectedObject = 0;
 
@@ -211,24 +294,39 @@ bool initialize() {
   animSpeed = 1.0f;
   orbitRadius = 2.0f;
   verticalAmplitude = 0.8f;
-  spinDegPerSec[0] = 30.0f;
-  spinDegPerSec[1] = 45.0f;
-  spinDegPerSec[2] = 15.0f;
+  spinDegPerSec = glm::vec3(30.0f, 45.0f, 15.0f);
 
-  for (size_t i = 0; i < renderObjects.size(); ++i) {
+  const glm::vec3 boxColors[3] = {
+      glm::vec3(0.8f, 0.3f, 0.3f),
+      glm::vec3(0.3f, 0.8f, 0.3f),
+      glm::vec3(0.3f, 0.3f, 0.8f),
+  };
+
+  // Три параллелепипеда в ряд по оси Х
+  for (size_t i = 0; i < 3; ++i) {
     RenderObject& object = renderObjects[i];
 
-    object.position[0] = -2.0f + 2.0f * float(i);
-    object.position[1] = 0.0f;
-    object.position[2] = 0.0f;
+    object.position = glm::vec3(-2.0f + 2.0f * float(i), 0.0f, 0.0f);
+    object.rotationDeg = glm::vec3(20.0f, 30.0f, 0.0f);
+    object.scale = glm::vec3(0.7f);
+    object.animated = true;
 
-    object.rotationDeg[0] = 20.0f;
-    object.rotationDeg[1] = 30.0f;
-    object.rotationDeg[2] = 0.0f;
-
-    object.scale[0] = object.scale[1] = object.scale[2] = 0.7f;
-    object.tint[0] = object.tint[1] = object.tint[2] = 1.0f;
+    object.albedo = boxColors[i];
+    object.specularColor = glm::vec3(1.0f);
+    object.shininess = 32.0f;
   }
+
+  // Пол (плоский параллелепипед)
+  RenderObject& floor = renderObjects[3];
+
+  floor.position = glm::vec3(0.0f, -1.5f, 0.0f);
+  floor.rotationDeg = glm::vec3(0.0f);
+  floor.scale = glm::vec3(10.0f, 0.1f, 15.0f);
+  floor.animated = false;
+
+  floor.albedo = glm::vec3(0.6f);
+  floor.specularColor = glm::vec3(0.2f);
+  floor.shininess = 8.0f;
 
   generateBoxGeometry();
 
