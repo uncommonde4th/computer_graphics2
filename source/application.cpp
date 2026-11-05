@@ -3,7 +3,6 @@
 #include "glm/ext/vector_float4.hpp"
 #include "glm/trigonometric.hpp"
 #include "graphics_internal.hpp"
-#include "vulkan/vulkan_core.h"
 
 #include <imgui.h>
 #include <array>
@@ -57,6 +56,13 @@ struct ModelUniform {
   glm::vec4 specular;
 };
 
+struct MarkerResource {
+  VkBuffer uniformBuffer = VK_NULL_HANDLE;
+  VmaAllocation uniformBufferAllocation = nullptr;
+  void* uniformBufferMemory = nullptr;
+  VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+};
+
 struct RenderObject {
   glm::vec3 position;
   glm::vec3 rotationDeg;
@@ -96,6 +102,11 @@ float sunIntensity;
 std::vector<PointLight> pointLights;
 std::vector<SpotLight> spotLights;
 uint32_t maxLights;
+bool showLightVisualizations = true;
+std::vector<MarkerResource> markerResources;
+VkBuffer coneVertexBuffer = VK_NULL_HANDLE;
+VmaAllocation coneVertexBufferAllocation = nullptr;
+void* coneVertexBufferMemory = nullptr;
 
 int selectedObject;
 
@@ -116,6 +127,7 @@ VkDescriptorSet sceneDescriptorSet = VK_NULL_HANDLE;
 VkShaderModule vertexShader = VK_NULL_HANDLE;
 VkShaderModule fragmentShader = VK_NULL_HANDLE;
 VkPipeline graphicsPipeline = VK_NULL_HANDLE;
+VkPipeline linePipeline = VK_NULL_HANDLE;
 
 VkBuffer vertexBuffer = VK_NULL_HANDLE;
 VmaAllocation vertexBufferAllocation = nullptr;
@@ -280,6 +292,8 @@ bool initialize() {
   sunIntensity = 0.5f;
 
   maxLights = 16;
+  showLightVisualizations = true;
+  markerResources.resize(size_t(maxLights) * 2 + 1);
 
   pointLights.push_back({
       .position = glm::vec4(0.0f, 2.5f, 3.0f, 1.0f),
@@ -381,6 +395,38 @@ bool initialize() {
     }
   }
 
+  // Отдельный uniform buffer и descriptor set для каждого маркера
+  for (MarkerResource& marker : markerResources) {
+    if (!createMappedBuffer(
+            sizeof(ModelUniform), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+            marker.uniformBuffer, marker.uniformBufferAllocation,
+            marker.uniformBufferMemory)) {
+      std::cerr << "Не удалось создать uniform buffer маркера\n";
+      return false;
+    }
+  }
+
+  // Для каждого конуса: 24 отрезка окружности и 4 образующие
+  constexpr size_t coneVerticesPerLight = 56;
+  if (!createMappedBuffer(
+          size_t(maxLights) * coneVerticesPerLight * sizeof(Vertex),
+          VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, coneVertexBuffer,
+          coneVertexBufferAllocation, coneVertexBufferMemory)) {
+    std::cerr << "Не удалось создать vertex buffer конусов\n";
+    return false;
+  }
+
+  // Общий UBO конусов
+  ModelUniform coneUniform{};
+  coneUniform.model = glm::mat4(1.0f);
+  coneUniform.normalMatrix = glm::mat4(1.0f);
+  coneUniform.albedo = glm::vec4(1.0f);
+  coneUniform.specular = glm::vec4(0.0f);
+  MarkerResource& coneResource = markerResources[size_t(maxLights) * 2];
+  memcpy(coneResource.uniformBufferMemory, &coneUniform, sizeof(coneUniform));
+  vmaFlushAllocation(context.allocator, coneResource.uniformBufferAllocation, 0,
+                     sizeof(coneUniform));
+
   VkDescriptorSetLayoutBinding sceneBindings[3]{
       {.binding = 0,
        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
@@ -431,7 +477,8 @@ bool initialize() {
     return false;
   }
 
-  const uint32_t setCount = 1 + static_cast<uint32_t>(renderObjects.size());
+  const uint32_t setCount = 1 + static_cast<uint32_t>(renderObjects.size()) +
+                            static_cast<uint32_t>(markerResources.size());
 
   VkDescriptorPoolSize poolSizes[2]{
       {
@@ -544,6 +591,38 @@ bool initialize() {
         .descriptorCount = 1,
         .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
         .pBufferInfo = &bufferInfo};
+
+    vkUpdateDescriptorSets(context.device, 1, &descriptorWrite, 0, nullptr);
+  }
+
+  for (MarkerResource& marker : markerResources) {
+    VkDescriptorSetAllocateInfo allocateInfo{
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = descriptorPool,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &modelSetLayout,
+    };
+
+    if (vkAllocateDescriptorSets(context.device, &allocateInfo,
+                                 &marker.descriptorSet) != VK_SUCCESS) {
+      std::cerr << "Не удалось выделить descriptor set маркера\n";
+      return false;
+    }
+
+    VkDescriptorBufferInfo bufferInfo{
+        .buffer = marker.uniformBuffer,
+        .offset = 0,
+        .range = sizeof(ModelUniform),
+    };
+
+    VkWriteDescriptorSet descriptorWrite{
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = marker.descriptorSet,
+        .dstBinding = 0,
+        .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+        .pBufferInfo = &bufferInfo,
+    };
 
     vkUpdateDescriptorSets(context.device, 1, &descriptorWrite, 0, nullptr);
   }
@@ -688,6 +767,19 @@ bool initialize() {
     return false;
   }
 
+  VkPipelineInputAssemblyStateCreateInfo lineAssemblyInfo = inputAssemblyInfo;
+  lineAssemblyInfo.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+
+  VkGraphicsPipelineCreateInfo linePipelineInfo = pipelineInfo;
+  linePipelineInfo.pInputAssemblyState = &lineAssemblyInfo;
+
+  if (vkCreateGraphicsPipelines(context.device, VK_NULL_HANDLE, 1,
+                                &linePipelineInfo, nullptr,
+                                &linePipeline) != VK_SUCCESS) {
+    std::cerr << "Не удалось создать pipeline проволочных конусов\n";
+    return false;
+  }
+
   return true;
 }
 
@@ -703,6 +795,16 @@ void shutdown() {
                      object.uniformBufferAllocation);
   }
 
+  for (MarkerResource& marker : markerResources) {
+    vmaUnmapMemory(context.allocator, marker.uniformBufferAllocation);
+    vmaDestroyBuffer(context.allocator, marker.uniformBuffer,
+                     marker.uniformBufferAllocation);
+  }
+
+  vmaUnmapMemory(context.allocator, coneVertexBufferAllocation);
+  vmaDestroyBuffer(context.allocator, coneVertexBuffer,
+                   coneVertexBufferAllocation);
+
   vmaUnmapMemory(context.allocator, spotLightBufferAllocation);
   vmaDestroyBuffer(context.allocator, spotLightBuffer,
                    spotLightBufferAllocation);
@@ -717,6 +819,7 @@ void shutdown() {
   vmaDestroyBuffer(context.allocator, indexBuffer, indexBufferAllocation);
   vmaDestroyBuffer(context.allocator, vertexBuffer, vertexBufferAllocation);
 
+  vkDestroyPipeline(context.device, linePipeline, nullptr);
   vkDestroyPipeline(context.device, graphicsPipeline, nullptr);
   vkDestroyPipelineLayout(context.device, pipelineLayout, nullptr);
   vkDestroyDescriptorSetLayout(context.device, modelSetLayout, nullptr);
@@ -765,6 +868,8 @@ void update([[maybe_unused]] double time) {
   ImGui::DragFloat3("Sun direction", glm::value_ptr(sunDirection), 0.01f);
   ImGui::ColorEdit3("Sun color", glm::value_ptr(sunColor));
   ImGui::SliderFloat("Sun intensity", &sunIntensity, 0.0f, 5.0f);
+  ImGui::Separator();
+  ImGui::Checkbox("Show light visualizations", &showLightVisualizations);
 
   // Точечные источники. Удаление откладываем до конца цикла, чтобы не менять вектор во время обхода.
   ImGui::Separator();
@@ -966,6 +1071,105 @@ void render(const graphics::internal::FrameData& fd) {
                        sizeof(ubo));
   }
 
+  // Подготовка цветных маркеров точечных и прожекторных источников.
+  // У каждого маркера собственный UBO, чтобы записи не перезаписывали
+  // данные предыдущих draw-команд в одном command buffer.
+  if (showLightVisualizations) {
+    auto updateMarker = [&](size_t resourceIndex, const glm::vec3& position,
+                            const glm::vec3& color) {
+      glm::mat4 model(1.0f);
+      model = glm::translate(model, position);
+      // Исходная геометрия имеет полуразмеры (0.75, 0.5, 0.4).
+      // Компенсируем пропорции, чтобы маркер стал кубом со стороной 0.24.
+      model = glm::scale(model,
+                         glm::vec3(0.12f / 0.75f, 0.12f / 0.5f, 0.12f / 0.4f));
+
+      ModelUniform markerUniform{};
+      markerUniform.model = model;
+      markerUniform.normalMatrix = glm::transpose(glm::inverse(model));
+      markerUniform.albedo = glm::vec4(color, 1.0f);
+      markerUniform.specular = glm::vec4(0.0f);  // unlit marker
+
+      MarkerResource& marker = markerResources[resourceIndex];
+      memcpy(marker.uniformBufferMemory, &markerUniform, sizeof(markerUniform));
+      vmaFlushAllocation(context.allocator, marker.uniformBufferAllocation, 0,
+                         sizeof(markerUniform));
+    };
+
+    for (size_t i = 0; i < pointLights.size(); ++i) {
+      updateMarker(i, glm::vec3(pointLights[i].position),
+                   glm::vec3(pointLights[i].color));
+    }
+
+    for (size_t i = 0; i < spotLights.size(); ++i) {
+      updateMarker(size_t(maxLights) + i, glm::vec3(spotLights[i].position),
+                   glm::vec3(spotLights[i].color));
+    }
+  }
+
+  // Проволочная геометрия внешних конусов прожекторов в мировых координатах.
+  // Перестраивается каждый кадр, поэтому следует за позицией, направлением и углом.
+  std::vector<Vertex> coneVertices;
+  if (showLightVisualizations) {
+    constexpr int segments = 24;
+    constexpr float coneLength = 1.5f;
+    coneVertices.reserve(spotLights.size() * 56);
+
+    auto addLine = [&](const glm::vec3& a, const glm::vec3& b) {
+      Vertex va{};
+      Vertex vb{};
+      va.position[0] = a.x;
+      va.position[1] = a.y;
+      va.position[2] = a.z;
+      vb.position[0] = b.x;
+      vb.position[1] = b.y;
+      vb.position[2] = b.z;
+      // Нормали не используются unlit-веткой фрагментного шейдера.
+      coneVertices.push_back(va);
+      coneVertices.push_back(vb);
+    };
+
+    for (const SpotLight& light : spotLights) {
+      glm::vec3 direction(light.direction);
+      if (glm::length(direction) < 0.0001f)
+        direction = glm::vec3(0.0f, -1.0f, 0.0f);
+      else
+        direction = glm::normalize(direction);
+
+      const glm::vec3 helper =
+          std::abs(glm::dot(direction, glm::vec3(0.0f, 1.0f, 0.0f))) > 0.95f
+              ? glm::vec3(1.0f, 0.0f, 0.0f)
+              : glm::vec3(0.0f, 1.0f, 0.0f);
+      const glm::vec3 right = glm::normalize(glm::cross(direction, helper));
+      const glm::vec3 up = glm::normalize(glm::cross(right, direction));
+
+      const glm::vec3 apex(light.position);
+      const glm::vec3 center = apex + direction * coneLength;
+      const float outerAngle = glm::clamp(light.cone.y, 0.1f, 89.0f);
+      const float radius = std::tan(glm::radians(outerAngle)) * coneLength;
+
+      std::array<glm::vec3, segments> ring{};
+      for (int j = 0; j < segments; ++j) {
+        const float angle = 6.28318530718f * float(j) / float(segments);
+        ring[size_t(j)] =
+            center + radius * (right * std::cos(angle) + up * std::sin(angle));
+      }
+
+      for (int j = 0; j < segments; ++j)
+        addLine(ring[size_t(j)], ring[size_t((j + 1) % segments)]);
+
+      for (int j = 0; j < segments; j += segments / 4)
+        addLine(apex, ring[size_t(j)]);
+    }
+
+    if (!coneVertices.empty()) {
+      const size_t bytes = coneVertices.size() * sizeof(Vertex);
+      memcpy(coneVertexBufferMemory, coneVertices.data(), bytes);
+      vmaFlushAllocation(context.allocator, coneVertexBufferAllocation, 0,
+                         bytes);
+    }
+  }
+
   // Очистка и заполнение черным
 
   vkResetCommandBuffer(fd.command_buffer, 0);
@@ -1026,6 +1230,54 @@ void render(const graphics::internal::FrameData& fd) {
                             nullptr);
     vkCmdDrawIndexed(fd.command_buffer, static_cast<uint32_t>(indices.size()),
                      1, 0, 0, 0);
+  }
+
+  if (showLightVisualizations) {
+    // Кубы точечных источников.
+    for (size_t i = 0; i < pointLights.size(); ++i) {
+      const VkDescriptorSet markerSet = markerResources[i].descriptorSet;
+      vkCmdBindDescriptorSets(fd.command_buffer,
+                              VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
+                              1, 1, &markerSet, 0, nullptr);
+      vkCmdDrawIndexed(fd.command_buffer, static_cast<uint32_t>(indices.size()),
+                       1, 0, 0, 0);
+    }
+
+    // Кубы прожекторных источников.
+    for (size_t i = 0; i < spotLights.size(); ++i) {
+      const VkDescriptorSet markerSet =
+          markerResources[size_t(maxLights) + i].descriptorSet;
+      vkCmdBindDescriptorSets(fd.command_buffer,
+                              VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
+                              1, 1, &markerSet, 0, nullptr);
+      vkCmdDrawIndexed(fd.command_buffer, static_cast<uint32_t>(indices.size()),
+                       1, 0, 0, 0);
+    }
+
+    // Белые проволочные конусы прожекторов.
+    if (!coneVertices.empty()) {
+      vkCmdBindPipeline(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                        linePipeline);
+      const VkDeviceSize lineOffset = 0;
+      vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &coneVertexBuffer,
+                             &lineOffset);
+
+      const VkDescriptorSet coneSet =
+          markerResources[size_t(maxLights) * 2].descriptorSet;
+      vkCmdBindDescriptorSets(fd.command_buffer,
+                              VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
+                              1, 1, &coneSet, 0, nullptr);
+      vkCmdDraw(fd.command_buffer, static_cast<uint32_t>(coneVertices.size()),
+                1, 0, 0);
+
+      // Восстанавливаем обычный pipeline и геометрию для последующих команд.
+      vkCmdBindPipeline(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                        graphicsPipeline);
+      vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &vertexBuffer,
+                             &vertexBufferOffset);
+      vkCmdBindIndexBuffer(fd.command_buffer, indexBuffer, 0,
+                           VK_INDEX_TYPE_UINT32);
+    }
   }
 
   vkCmdEndRenderPass(fd.command_buffer);
