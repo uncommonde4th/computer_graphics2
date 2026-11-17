@@ -10,8 +10,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <string>
 #include <vector>
 
 #define GLM_FORCE_RADIANS
@@ -21,11 +23,15 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>
+
 namespace application {
 
 struct Vertex {
   float position[3];
   float normal[3];
+  float texCoord[2];
 };
 
 struct SceneUniform {
@@ -49,6 +55,7 @@ struct SpotLight {
   glm::vec4 cone;
 };
 
+// Элемент динамического uniform буфера (одна модель)
 struct ModelUniform {
   glm::mat4 model;
   glm::mat4 normalMatrix;
@@ -56,10 +63,19 @@ struct ModelUniform {
   glm::vec4 specular;
 };
 
-struct MarkerResource {
-  VkBuffer uniformBuffer = VK_NULL_HANDLE;
-  VmaAllocation uniformBufferAllocation = nullptr;
-  void* uniformBufferMemory = nullptr;
+// Push константы включают нетривиальное сэмплирование
+struct PushConstants {
+  uint32_t effect;
+  float time;
+};
+
+// Текстура и её материал свой набор дескрипторов
+// (динамический uniform буфер + изображение с сэмплером)
+struct Texture {
+  std::string name;
+  VkImage image = VK_NULL_HANDLE;
+  VmaAllocation allocation = nullptr;
+  VkImageView view = VK_NULL_HANDLE;
   VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
 };
 
@@ -69,17 +85,16 @@ struct RenderObject {
   glm::vec3 scale;
   bool animated;
 
-  glm::vec3 albedo;
+  int textureIndex;
+  bool nonTrivialSampling;
+
   glm::vec3 specularColor;
   float shininess;
-
-  VkBuffer uniformBuffer = VK_NULL_HANDLE;
-  VmaAllocation uniformBufferAllocation = nullptr;
-  void* uniformBufferMemory = nullptr;
-  VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
 };
 
 std::array<RenderObject, 4> renderObjects{};
+
+std::vector<Texture> textures;
 
 std::vector<Vertex> vertices;
 std::vector<uint32_t> indices;
@@ -103,7 +118,6 @@ std::vector<PointLight> pointLights;
 std::vector<SpotLight> spotLights;
 uint32_t maxLights;
 bool showLightVisualizations = true;
-std::vector<MarkerResource> markerResources;
 VkBuffer coneVertexBuffer = VK_NULL_HANDLE;
 VmaAllocation coneVertexBufferAllocation = nullptr;
 void* coneVertexBufferMemory = nullptr;
@@ -120,7 +134,7 @@ glm::vec3 spinDegPerSec;
 
 VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
 VkDescriptorSetLayout sceneSetLayout = VK_NULL_HANDLE;
-VkDescriptorSetLayout modelSetLayout = VK_NULL_HANDLE;
+VkDescriptorSetLayout materialSetLayout = VK_NULL_HANDLE;
 VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
 VkDescriptorSet sceneDescriptorSet = VK_NULL_HANDLE;
 
@@ -129,6 +143,7 @@ VkShaderModule fragmentShader = VK_NULL_HANDLE;
 VkPipeline graphicsPipeline = VK_NULL_HANDLE;
 VkPipeline linePipeline = VK_NULL_HANDLE;
 
+// Вершины и индексы лежат в VRAM
 VkBuffer vertexBuffer = VK_NULL_HANDLE;
 VmaAllocation vertexBufferAllocation = nullptr;
 VkBuffer indexBuffer = VK_NULL_HANDLE;
@@ -145,6 +160,31 @@ void* pointLightBufferMemory = nullptr;
 VkBuffer spotLightBuffer = VK_NULL_HANDLE;
 VmaAllocation spotLightBufferAllocation = nullptr;
 void* spotLightBufferMemory = nullptr;
+
+// Один динамический uniform буфер на все модели
+VkBuffer modelBuffer = VK_NULL_HANDLE;
+VmaAllocation modelBufferAllocation = nullptr;
+void* modelBufferMemory = nullptr;
+size_t modelStride = 0;
+
+VkSampler sampler = VK_NULL_HANDLE;
+VkCommandPool transferCommandPool = VK_NULL_HANDLE;
+
+size_t pointMarkerIndex(size_t i) {
+  return renderObjects.size() + i;
+}
+size_t spotMarkerIndex(size_t i) {
+  return renderObjects.size() + size_t(maxLights) + i;
+}
+size_t coneIndex() {
+  return renderObjects.size() + size_t(maxLights) * 2;
+}
+
+// Записывает данные модели в её элемент динамического буфера
+void writeModel(size_t index, const ModelUniform& ubo) {
+  memcpy(static_cast<char*>(modelBufferMemory) + index * modelStride, &ubo,
+         sizeof(ubo));
+}
 
 // Читает скомпилированный шейдер .spv
 VkShaderModule loadShaderModule(const char path[]) {
@@ -173,7 +213,7 @@ VkShaderModule loadShaderModule(const char path[]) {
   return result;
 }
 
-// Создает буфер в памяти, доступной процессору (для вершин и индексов, которые не меняются)
+// Создает staging буфер в памяти, доступной процессору, и копирует туда данные
 bool createBuffer(const void* data, size_t size, VkBufferUsageFlags usage,
                   VkBuffer& buffer, VmaAllocation& allocation) {
   auto& context = graphics::internal::context;
@@ -230,6 +270,223 @@ bool createMappedBuffer(size_t size, VkBufferUsageFlags usage, VkBuffer& buffer,
   return vmaMapMemory(context.allocator, allocation, &memory) == VK_SUCCESS;
 }
 
+// Командный буфер для разовых операций (копирование в VRAM)
+VkCommandBuffer beginSingleTimeCommands() {
+  auto& context = graphics::internal::context;
+
+  VkCommandBufferAllocateInfo allocateInfo{
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+      .commandPool = transferCommandPool,
+      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+      .commandBufferCount = 1,
+  };
+
+  VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+  vkAllocateCommandBuffers(context.device, &allocateInfo, &commandBuffer);
+
+  VkCommandBufferBeginInfo beginInfo{
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+  };
+  vkBeginCommandBuffer(commandBuffer, &beginInfo);
+
+  return commandBuffer;
+}
+
+// Отправляет команды и ждет их выполнения
+void endSingleTimeCommands(VkCommandBuffer commandBuffer) {
+  auto& context = graphics::internal::context;
+
+  vkEndCommandBuffer(commandBuffer);
+
+  VkSubmitInfo submitInfo{
+      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+      .commandBufferCount = 1,
+      .pCommandBuffers = &commandBuffer,
+  };
+
+  vkQueueSubmit(context.graphics_queue, 1, &submitInfo, VK_NULL_HANDLE);
+  vkQueueWaitIdle(context.graphics_queue);
+
+  vkFreeCommandBuffers(context.device, transferCommandPool, 1, &commandBuffer);
+}
+
+// Создает буфер в VRAM данные сначала попадают в staging буфер, затем копируются командой GPU
+bool createDeviceBuffer(const void* data, size_t size, VkBufferUsageFlags usage,
+                        VkBuffer& buffer, VmaAllocation& allocation) {
+  auto& context = graphics::internal::context;
+
+  VkBuffer stagingBuffer = VK_NULL_HANDLE;
+  VmaAllocation stagingAllocation = nullptr;
+
+  if (!createBuffer(data, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, stagingBuffer,
+                    stagingAllocation)) {
+    return false;
+  }
+
+  VkBufferCreateInfo bufferInfo{
+      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+      .size = size,
+      .usage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+  };
+
+  VmaAllocationCreateInfo allocationInfo{
+      .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+  };
+
+  if (vmaCreateBuffer(context.allocator, &bufferInfo, &allocationInfo, &buffer,
+                      &allocation, nullptr) != VK_SUCCESS) {
+    vmaDestroyBuffer(context.allocator, stagingBuffer, stagingAllocation);
+    return false;
+  }
+
+  VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+  VkBufferCopy copyRegion{
+      .srcOffset = 0,
+      .dstOffset = 0,
+      .size = size,
+  };
+  vkCmdCopyBuffer(commandBuffer, stagingBuffer, buffer, 1, &copyRegion);
+
+  endSingleTimeCommands(commandBuffer);
+
+  vmaDestroyBuffer(context.allocator, stagingBuffer, stagingAllocation);
+  return true;
+}
+
+// Загружает изображение с диска и создает из него текстуру в VRAM
+bool loadTexture(const std::string& path, Texture& texture) {
+  auto& context = graphics::internal::context;
+
+  int width = 0;
+  int height = 0;
+  int channels = 0;
+  stbi_uc* pixels =
+      stbi_load(path.c_str(), &width, &height, &channels, STBI_rgb_alpha);
+  if (pixels == nullptr) {
+    std::cerr << "Не удалось загрузить изображение " << path << "\n";
+    return false;
+  }
+
+  const size_t imageSize = size_t(width) * size_t(height) * 4;
+
+  VkBuffer stagingBuffer = VK_NULL_HANDLE;
+  VmaAllocation stagingAllocation = nullptr;
+  const bool staged =
+      createBuffer(pixels, imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                   stagingBuffer, stagingAllocation);
+  stbi_image_free(pixels);
+  if (!staged) {
+    return false;
+  }
+
+  // Изображение с цветом (sRGB), память в VRAM
+  VkImageCreateInfo imageInfo{
+      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      .imageType = VK_IMAGE_TYPE_2D,
+      .format = VK_FORMAT_R8G8B8A8_SRGB,
+      .extent = {uint32_t(width), uint32_t(height), 1},
+      .mipLevels = 1,
+      .arrayLayers = 1,
+      .samples = VK_SAMPLE_COUNT_1_BIT,
+      .tiling = VK_IMAGE_TILING_OPTIMAL,
+      .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+  };
+
+  VmaAllocationCreateInfo allocationInfo{
+      .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+  };
+
+  if (vmaCreateImage(context.allocator, &imageInfo, &allocationInfo,
+                     &texture.image, &texture.allocation,
+                     nullptr) != VK_SUCCESS) {
+    vmaDestroyBuffer(context.allocator, stagingBuffer, stagingAllocation);
+    std::cerr << "Не удалось создать изображение для текстуры " << path << "\n";
+    return false;
+  }
+
+  VkImageSubresourceRange subresourceRange{
+      .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+      .baseMipLevel = 0,
+      .levelCount = 1,
+      .baseArrayLayer = 0,
+      .layerCount = 1,
+  };
+
+  VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+  // готовим изображение к копированию
+  VkImageMemoryBarrier toTransfer{
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+      .srcAccessMask = 0,
+      .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+      .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+      .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .image = texture.image,
+      .subresourceRange = subresourceRange,
+  };
+
+  vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                       nullptr, 1, &toTransfer);
+
+  VkBufferImageCopy copyRegion{
+      .bufferOffset = 0,
+      .bufferRowLength = 0,
+      .bufferImageHeight = 0,
+      .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+      .imageOffset = {0, 0, 0},
+      .imageExtent = {uint32_t(width), uint32_t(height), 1},
+  };
+
+  vkCmdCopyBufferToImage(commandBuffer, stagingBuffer, texture.image,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
+
+  // изображение можно читать из шейдера
+  VkImageMemoryBarrier toShaderRead{
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+      .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+      .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+      .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+      .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .image = texture.image,
+      .subresourceRange = subresourceRange,
+  };
+
+  vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0,
+                       nullptr, 1, &toShaderRead);
+
+  endSingleTimeCommands(commandBuffer);
+
+  vmaDestroyBuffer(context.allocator, stagingBuffer, stagingAllocation);
+
+  VkImageViewCreateInfo viewInfo{
+      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+      .image = texture.image,
+      .viewType = VK_IMAGE_VIEW_TYPE_2D,
+      .format = VK_FORMAT_R8G8B8A8_SRGB,
+      .subresourceRange = subresourceRange,
+  };
+
+  if (vkCreateImageView(context.device, &viewInfo, nullptr, &texture.view) !=
+      VK_SUCCESS) {
+    std::cerr << "Не удалось создать image view для текстуры " << path << "\n";
+    return false;
+  }
+
+  texture.name = std::filesystem::path(path).filename().string();
+  return true;
+}
+
 // Строит параллелепипед
 void generateBoxGeometry() {
   vertices.clear();
@@ -259,6 +516,10 @@ void generateBoxGeometry() {
         vertex.position[v] = cornerV[corner] * halfSize[v];
 
         vertex.normal[axis] = sign;
+
+        // Текстурные координаты: каждая грань целиком покрывается текстурой
+        vertex.texCoord[0] = (cornerU[corner] + 1.0f) * 0.5f;
+        vertex.texCoord[1] = (cornerV[corner] + 1.0f) * 0.5f;
 
         vertices.push_back(vertex);
       }
@@ -293,7 +554,6 @@ bool initialize() {
 
   maxLights = 16;
   showLightVisualizations = true;
-  markerResources.resize(size_t(maxLights) * 2 + 1);
 
   pointLights.push_back({
       .position = glm::vec4(0.0f, 2.5f, 3.0f, 1.0f),
@@ -316,12 +576,6 @@ bool initialize() {
   verticalAmplitude = 0.8f;
   spinDegPerSec = glm::vec3(30.0f, 45.0f, 15.0f);
 
-  const glm::vec3 boxColors[3] = {
-      glm::vec3(0.8f, 0.3f, 0.3f),
-      glm::vec3(0.3f, 0.8f, 0.3f),
-      glm::vec3(0.3f, 0.3f, 0.8f),
-  };
-
   // Три параллелепипеда в ряд по оси Х
   for (size_t i = 0; i < 3; ++i) {
     RenderObject& object = renderObjects[i];
@@ -331,10 +585,15 @@ bool initialize() {
     object.scale = glm::vec3(0.7f);
     object.animated = true;
 
-    object.albedo = boxColors[i];
+    object.textureIndex = int(i);
+    object.nonTrivialSampling = false;
+
     object.specularColor = glm::vec3(1.0f);
     object.shininess = 32.0f;
   }
+
+  // Нетривиальное сэмплирование включено у среднего параллелепипеда
+  renderObjects[1].nonTrivialSampling = true;
 
   // Пол (плоский параллелепипед)
   RenderObject& floor = renderObjects[3];
@@ -344,22 +603,37 @@ bool initialize() {
   floor.scale = glm::vec3(10.0f, 0.1f, 15.0f);
   floor.animated = false;
 
-  floor.albedo = glm::vec3(0.6f);
+  floor.textureIndex = 3;
+  floor.nonTrivialSampling = false;
+
   floor.specularColor = glm::vec3(0.2f);
   floor.shininess = 8.0f;
 
   generateBoxGeometry();
 
-  if (!createBuffer(vertices.data(), vertices.size() * sizeof(Vertex),
-                    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vertexBuffer,
-                    vertexBufferAllocation)) {
+  // Command pool для разовых команд копирования
+  VkCommandPoolCreateInfo commandPoolInfo{
+      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+      .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+      .queueFamilyIndex = context.graphics_queue_index,
+  };
+
+  if (vkCreateCommandPool(context.device, &commandPoolInfo, nullptr,
+                          &transferCommandPool) != VK_SUCCESS) {
+    std::cerr << "Не удалось создать command pool для копирования\n";
+    return false;
+  }
+
+  if (!createDeviceBuffer(vertices.data(), vertices.size() * sizeof(Vertex),
+                          VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vertexBuffer,
+                          vertexBufferAllocation)) {
     std::cerr << "Не удалось создать vertex buffer\n";
     return false;
   }
 
-  if (!createBuffer(indices.data(), indices.size() * sizeof(uint32_t),
-                    VK_BUFFER_USAGE_INDEX_BUFFER_BIT, indexBuffer,
-                    indexBufferAllocation)) {
+  if (!createDeviceBuffer(indices.data(), indices.size() * sizeof(uint32_t),
+                          VK_BUFFER_USAGE_INDEX_BUFFER_BIT, indexBuffer,
+                          indexBufferAllocation)) {
     std::cerr << "Не удалось создать index buffer\n";
     return false;
   }
@@ -385,25 +659,18 @@ bool initialize() {
     return false;
   }
 
-  for (RenderObject& object : renderObjects) {
-    if (!createMappedBuffer(
-            sizeof(ModelUniform), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-            object.uniformBuffer, object.uniformBufferAllocation,
-            object.uniformBufferMemory)) {
-      std::cerr << "Не удалось создать uniform buffer объекта\n";
-      return false;
-    }
-  }
+  // Динамический uniform буфер
+  VkPhysicalDeviceProperties deviceProperties{};
+  vkGetPhysicalDeviceProperties(context.physical_device, &deviceProperties);
+  const size_t alignment =
+      size_t(deviceProperties.limits.minUniformBufferOffsetAlignment);
+  modelStride = (sizeof(ModelUniform) + alignment - 1) / alignment * alignment;
 
-  // Отдельный uniform buffer и descriptor set для каждого маркера
-  for (MarkerResource& marker : markerResources) {
-    if (!createMappedBuffer(
-            sizeof(ModelUniform), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-            marker.uniformBuffer, marker.uniformBufferAllocation,
-            marker.uniformBufferMemory)) {
-      std::cerr << "Не удалось создать uniform buffer маркера\n";
-      return false;
-    }
+  if (!createMappedBuffer((coneIndex() + 1) * modelStride,
+                          VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, modelBuffer,
+                          modelBufferAllocation, modelBufferMemory)) {
+    std::cerr << "Не удалось создать динамический uniform buffer\n";
+    return false;
   }
 
   // Для каждого конуса: 24 отрезка окружности и 4 образующие
@@ -416,16 +683,48 @@ bool initialize() {
     return false;
   }
 
-  // Общий UBO конусов
+  // Общий элемент конусов
   ModelUniform coneUniform{};
   coneUniform.model = glm::mat4(1.0f);
   coneUniform.normalMatrix = glm::mat4(1.0f);
   coneUniform.albedo = glm::vec4(1.0f);
   coneUniform.specular = glm::vec4(0.0f);
-  MarkerResource& coneResource = markerResources[size_t(maxLights) * 2];
-  memcpy(coneResource.uniformBufferMemory, &coneUniform, sizeof(coneUniform));
-  vmaFlushAllocation(context.allocator, coneResource.uniformBufferAllocation, 0,
-                     sizeof(coneUniform));
+  writeModel(coneIndex(), coneUniform);
+
+  // Текстуры
+  const std::vector<std::string> texturePaths = {
+      "textures/sharingan.png",
+      "textures/grass.png",
+      "textures/sheep.png",
+  };
+
+  textures.resize(texturePaths.size());
+  for (size_t i = 0; i < texturePaths.size(); ++i) {
+    if (!loadTexture(texturePaths[i], textures[i])) {
+      return false;
+    }
+  }
+
+  for (RenderObject& object : renderObjects) {
+    object.textureIndex %= int(textures.size());
+  }
+
+  VkSamplerCreateInfo samplerInfo{};
+  samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+  samplerInfo.magFilter = VK_FILTER_LINEAR;
+  samplerInfo.minFilter = VK_FILTER_LINEAR;
+  samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+  samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+  samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+  samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+  samplerInfo.maxLod = 1.0f;
+  samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+
+  if (vkCreateSampler(context.device, &samplerInfo, nullptr, &sampler) !=
+      VK_SUCCESS) {
+    std::cerr << "Не удалось создать sampler\n";
+    return false;
+  }
 
   VkDescriptorSetLayoutBinding sceneBindings[3]{
       {.binding = 0,
@@ -458,43 +757,60 @@ bool initialize() {
     return false;
   }
 
-  VkDescriptorSetLayoutBinding modelBinding{
-      .binding = 0,
-      .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-      .descriptorCount = 1,
-      .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+  // Набор материала: динамический uniform буфер моделей + текстура
+  VkDescriptorSetLayoutBinding materialBindings[2]{
+      {
+          .binding = 0,
+          .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+          .descriptorCount = 1,
+          .stageFlags =
+              VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+      },
+      {
+          .binding = 1,
+          .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+          .descriptorCount = 1,
+          .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+      },
   };
 
-  VkDescriptorSetLayoutCreateInfo modelLayoutInfo{
+  VkDescriptorSetLayoutCreateInfo materialLayoutInfo{
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-      .bindingCount = 1,
-      .pBindings = &modelBinding,
+      .bindingCount = 2,
+      .pBindings = materialBindings,
   };
 
-  if (vkCreateDescriptorSetLayout(context.device, &modelLayoutInfo, nullptr,
-                                  &modelSetLayout) != VK_SUCCESS) {
-    std::cerr << "Не удалось создать descriptor set layout модели \n";
+  if (vkCreateDescriptorSetLayout(context.device, &materialLayoutInfo, nullptr,
+                                  &materialSetLayout) != VK_SUCCESS) {
+    std::cerr << "Не удалось создать descriptor set layout материала \n";
     return false;
   }
 
-  const uint32_t setCount = 1 + static_cast<uint32_t>(renderObjects.size()) +
-                            static_cast<uint32_t>(markerResources.size());
+  const uint32_t textureCount = static_cast<uint32_t>(textures.size());
 
-  VkDescriptorPoolSize poolSizes[2]{
+  VkDescriptorPoolSize poolSizes[4]{
       {
           .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-          .descriptorCount = setCount,
+          .descriptorCount = 1,
       },
       {
           .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
           .descriptorCount = 2,
       },
+      {
+          .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+          .descriptorCount = textureCount,
+      },
+      {
+          .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+          .descriptorCount = textureCount,
+      },
   };
 
   VkDescriptorPoolCreateInfo descriptorPoolInfo{
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-      .maxSets = setCount,
-      .poolSizeCount = 2,
+      .maxSets = 1 + textureCount,
+      .poolSizeCount = 4,
       .pPoolSizes = poolSizes,
   };
 
@@ -565,75 +881,72 @@ bool initialize() {
 
   vkUpdateDescriptorSets(context.device, 3, sceneWrites, 0, nullptr);
 
-  // Descriptor set каждого объекта
-  for (RenderObject& object : renderObjects) {
+  // Descriptor set каждого материала, один и тот же динамический буфер, своя текстура
+  for (Texture& texture : textures) {
     VkDescriptorSetAllocateInfo allocateInfo{
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
         .descriptorPool = descriptorPool,
         .descriptorSetCount = 1,
-        .pSetLayouts = &modelSetLayout,
+        .pSetLayouts = &materialSetLayout,
     };
 
     if (vkAllocateDescriptorSets(context.device, &allocateInfo,
-                                 &object.descriptorSet) != VK_SUCCESS) {
-      std::cerr << "Не удалось выделить descriptor set\n";
+                                 &texture.descriptorSet) != VK_SUCCESS) {
+      std::cerr << "Не удалось выделить descriptor set материала\n";
       return false;
     }
 
-    VkDescriptorBufferInfo bufferInfo{.buffer = object.uniformBuffer,
-                                      .offset = 0,
-                                      .range = sizeof(ModelUniform)};
-
-    VkWriteDescriptorSet descriptorWrite{
-        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .dstSet = object.descriptorSet,
-        .dstBinding = 0,
-        .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-        .pBufferInfo = &bufferInfo};
-
-    vkUpdateDescriptorSets(context.device, 1, &descriptorWrite, 0, nullptr);
-  }
-
-  for (MarkerResource& marker : markerResources) {
-    VkDescriptorSetAllocateInfo allocateInfo{
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-        .descriptorPool = descriptorPool,
-        .descriptorSetCount = 1,
-        .pSetLayouts = &modelSetLayout,
-    };
-
-    if (vkAllocateDescriptorSets(context.device, &allocateInfo,
-                                 &marker.descriptorSet) != VK_SUCCESS) {
-      std::cerr << "Не удалось выделить descriptor set маркера\n";
-      return false;
-    }
-
-    VkDescriptorBufferInfo bufferInfo{
-        .buffer = marker.uniformBuffer,
+    // range - размер одного элемента, сдвиг добавляется при привязке набора
+    VkDescriptorBufferInfo modelBufferInfo{
+        .buffer = modelBuffer,
         .offset = 0,
         .range = sizeof(ModelUniform),
     };
 
-    VkWriteDescriptorSet descriptorWrite{
-        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .dstSet = marker.descriptorSet,
-        .dstBinding = 0,
-        .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-        .pBufferInfo = &bufferInfo,
+    VkDescriptorImageInfo imageInfo{
+        .sampler = sampler,
+        .imageView = texture.view,
+        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
     };
 
-    vkUpdateDescriptorSets(context.device, 1, &descriptorWrite, 0, nullptr);
+    VkWriteDescriptorSet materialWrites[2]{
+        {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = texture.descriptorSet,
+            .dstBinding = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+            .pBufferInfo = &modelBufferInfo,
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = texture.descriptorSet,
+            .dstBinding = 1,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo = &imageInfo,
+        },
+    };
+
+    vkUpdateDescriptorSets(context.device, 2, materialWrites, 0, nullptr);
   }
 
-  VkDescriptorSetLayout setLayouts[2] = {sceneSetLayout, modelSetLayout};
+  VkDescriptorSetLayout setLayouts[2] = {sceneSetLayout, materialSetLayout};
+
+  // Push константы, нужны только фрагментному шейдеру
+  VkPushConstantRange pushRange{
+      .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+      .offset = 0,
+      .size = sizeof(PushConstants),
+  };
 
   // Набор ресурсов для pipeline
   VkPipelineLayoutCreateInfo layoutInfo{
       .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
       .setLayoutCount = 2,
       .pSetLayouts = setLayouts,
+      .pushConstantRangeCount = 1,
+      .pPushConstantRanges = &pushRange,
   };
 
   if (vkCreatePipelineLayout(context.device, &layoutInfo, nullptr,
@@ -671,7 +984,7 @@ bool initialize() {
       .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
   };
 
-  VkVertexInputAttributeDescription vertexAttributes[2]{
+  VkVertexInputAttributeDescription vertexAttributes[3]{
       {.location = 0,
        .binding = 0,
        .format = VK_FORMAT_R32G32B32_SFLOAT,
@@ -680,6 +993,10 @@ bool initialize() {
        .binding = 0,
        .format = VK_FORMAT_R32G32B32_SFLOAT,
        .offset = offsetof(Vertex, normal)},
+      {.location = 2,
+       .binding = 0,
+       .format = VK_FORMAT_R32G32_SFLOAT,
+       .offset = offsetof(Vertex, texCoord)},
   };
 
   VkPipelineVertexInputStateCreateInfo vertexInputInfo{};
@@ -687,7 +1004,7 @@ bool initialize() {
       VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
   vertexInputInfo.vertexBindingDescriptionCount = 1;
   vertexInputInfo.pVertexBindingDescriptions = &vertexBinding;
-  vertexInputInfo.vertexAttributeDescriptionCount = 2;
+  vertexInputInfo.vertexAttributeDescriptionCount = 3;
   vertexInputInfo.pVertexAttributeDescriptions = vertexAttributes;
 
   // Отдельный треугольник каждые 3 индекса
@@ -789,17 +1106,15 @@ void shutdown() {
 
   vkDestroyDescriptorPool(context.device, descriptorPool, nullptr);
 
-  for (RenderObject& object : renderObjects) {
-    vmaUnmapMemory(context.allocator, object.uniformBufferAllocation);
-    vmaDestroyBuffer(context.allocator, object.uniformBuffer,
-                     object.uniformBufferAllocation);
+  vkDestroySampler(context.device, sampler, nullptr);
+
+  for (Texture& texture : textures) {
+    vkDestroyImageView(context.device, texture.view, nullptr);
+    vmaDestroyImage(context.allocator, texture.image, texture.allocation);
   }
 
-  for (MarkerResource& marker : markerResources) {
-    vmaUnmapMemory(context.allocator, marker.uniformBufferAllocation);
-    vmaDestroyBuffer(context.allocator, marker.uniformBuffer,
-                     marker.uniformBufferAllocation);
-  }
+  vmaUnmapMemory(context.allocator, modelBufferAllocation);
+  vmaDestroyBuffer(context.allocator, modelBuffer, modelBufferAllocation);
 
   vmaUnmapMemory(context.allocator, coneVertexBufferAllocation);
   vmaDestroyBuffer(context.allocator, coneVertexBuffer,
@@ -822,11 +1137,13 @@ void shutdown() {
   vkDestroyPipeline(context.device, linePipeline, nullptr);
   vkDestroyPipeline(context.device, graphicsPipeline, nullptr);
   vkDestroyPipelineLayout(context.device, pipelineLayout, nullptr);
-  vkDestroyDescriptorSetLayout(context.device, modelSetLayout, nullptr);
+  vkDestroyDescriptorSetLayout(context.device, materialSetLayout, nullptr);
   vkDestroyDescriptorSetLayout(context.device, sceneSetLayout, nullptr);
 
   vkDestroyShaderModule(context.device, vertexShader, nullptr);
   vkDestroyShaderModule(context.device, fragmentShader, nullptr);
+
+  vkDestroyCommandPool(context.device, transferCommandPool, nullptr);
 }
 
 // логика кадра и интерфейс (каждый кадр до render)
@@ -962,7 +1279,21 @@ void update([[maybe_unused]] double time) {
 
   ImGui::Separator();
   ImGui::Text("Material");
-  ImGui::ColorEdit3("Albedo", glm::value_ptr(selected.albedo));
+
+  // Выбор текстуры из выпадающего списка
+  if (ImGui::BeginCombo("Texture",
+                        textures[selected.textureIndex].name.c_str())) {
+    for (int i = 0; i < int(textures.size()); ++i) {
+      const bool isSelected = (selected.textureIndex == i);
+      if (ImGui::Selectable(textures[i].name.c_str(), isSelected))
+        selected.textureIndex = i;
+      if (isSelected)
+        ImGui::SetItemDefaultFocus();
+    }
+    ImGui::EndCombo();
+  }
+
+  ImGui::Checkbox("Non-trivial sampling", &selected.nonTrivialSampling);
   ImGui::ColorEdit3("Specular color", glm::value_ptr(selected.specularColor));
   ImGui::SliderFloat("Shininess", &selected.shininess, 1.0f, 256.0f);
 
@@ -1063,19 +1394,17 @@ void render(const graphics::internal::FrameData& fd) {
     ModelUniform ubo{};
     ubo.model = model;
     ubo.normalMatrix = glm::transpose(glm::inverse(model));
-    ubo.albedo = glm::vec4(object.albedo, 1.0f);
+    ubo.albedo = glm::vec4(1.0f);
     ubo.specular = glm::vec4(object.specularColor, object.shininess);
 
-    memcpy(object.uniformBufferMemory, &ubo, sizeof(ubo));
-    vmaFlushAllocation(context.allocator, object.uniformBufferAllocation, 0,
-                       sizeof(ubo));
+    writeModel(i, ubo);
   }
 
   // Подготовка цветных маркеров точечных и прожекторных источников.
-  // У каждого маркера собственный UBO, чтобы записи не перезаписывали
-  // данные предыдущих draw-команд в одном command buffer.
+  // У каждого маркера свой элемент динамического буфера, чтобы записи не
+  // перезаписывали данные предыдущих draw-команд в одном command buffer.
   if (showLightVisualizations) {
-    auto updateMarker = [&](size_t resourceIndex, const glm::vec3& position,
+    auto updateMarker = [&](size_t modelIndex, const glm::vec3& position,
                             const glm::vec3& color) {
       glm::mat4 model(1.0f);
       model = glm::translate(model, position);
@@ -1090,22 +1419,23 @@ void render(const graphics::internal::FrameData& fd) {
       markerUniform.albedo = glm::vec4(color, 1.0f);
       markerUniform.specular = glm::vec4(0.0f);  // unlit marker
 
-      MarkerResource& marker = markerResources[resourceIndex];
-      memcpy(marker.uniformBufferMemory, &markerUniform, sizeof(markerUniform));
-      vmaFlushAllocation(context.allocator, marker.uniformBufferAllocation, 0,
-                         sizeof(markerUniform));
+      writeModel(modelIndex, markerUniform);
     };
 
     for (size_t i = 0; i < pointLights.size(); ++i) {
-      updateMarker(i, glm::vec3(pointLights[i].position),
+      updateMarker(pointMarkerIndex(i), glm::vec3(pointLights[i].position),
                    glm::vec3(pointLights[i].color));
     }
 
     for (size_t i = 0; i < spotLights.size(); ++i) {
-      updateMarker(size_t(maxLights) + i, glm::vec3(spotLights[i].position),
+      updateMarker(spotMarkerIndex(i), glm::vec3(spotLights[i].position),
                    glm::vec3(spotLights[i].color));
     }
   }
+
+  // Все элементы динамического буфера записаны
+  vmaFlushAllocation(context.allocator, modelBufferAllocation, 0,
+                     VK_WHOLE_SIZE);
 
   // Проволочная геометрия внешних конусов прожекторов в мировых координатах.
   // Перестраивается каждый кадр, поэтому следует за позицией, направлением и углом.
@@ -1124,7 +1454,6 @@ void render(const graphics::internal::FrameData& fd) {
       vb.position[0] = b.x;
       vb.position[1] = b.y;
       vb.position[2] = b.z;
-      // Нормали не используются unlit-веткой фрагментного шейдера.
       coneVertices.push_back(va);
       coneVertices.push_back(vb);
     };
@@ -1223,11 +1552,25 @@ void render(const graphics::internal::FrameData& fd) {
                           pipelineLayout, 0, 1, &sceneDescriptorSet, 0,
                           nullptr);
 
-  // Set 1 (модель) у каждого объекта свой
-  for (const RenderObject& object : renderObjects) {
+  // Set 1 (материал)
+  auto bindModel = [&](size_t modelIndex, const VkDescriptorSet& materialSet,
+                       uint32_t effect) {
+    const uint32_t dynamicOffset = uint32_t(modelIndex * modelStride);
     vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            pipelineLayout, 1, 1, &object.descriptorSet, 0,
-                            nullptr);
+                            pipelineLayout, 1, 1, &materialSet, 1,
+                            &dynamicOffset);
+
+    PushConstants pushConstants{effect, animTime};
+    vkCmdPushConstants(fd.command_buffer, pipelineLayout,
+                       VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pushConstants),
+                       &pushConstants);
+  };
+
+  for (size_t i = 0; i < renderObjects.size(); ++i) {
+    const RenderObject& object = renderObjects[i];
+
+    bindModel(i, textures[object.textureIndex].descriptorSet,
+              object.nonTrivialSampling ? 1 : 0);
     vkCmdDrawIndexed(fd.command_buffer, static_cast<uint32_t>(indices.size()),
                      1, 0, 0, 0);
   }
@@ -1235,21 +1578,14 @@ void render(const graphics::internal::FrameData& fd) {
   if (showLightVisualizations) {
     // Кубы точечных источников.
     for (size_t i = 0; i < pointLights.size(); ++i) {
-      const VkDescriptorSet markerSet = markerResources[i].descriptorSet;
-      vkCmdBindDescriptorSets(fd.command_buffer,
-                              VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
-                              1, 1, &markerSet, 0, nullptr);
+      bindModel(pointMarkerIndex(i), textures[0].descriptorSet, 0);
       vkCmdDrawIndexed(fd.command_buffer, static_cast<uint32_t>(indices.size()),
                        1, 0, 0, 0);
     }
 
     // Кубы прожекторных источников.
     for (size_t i = 0; i < spotLights.size(); ++i) {
-      const VkDescriptorSet markerSet =
-          markerResources[size_t(maxLights) + i].descriptorSet;
-      vkCmdBindDescriptorSets(fd.command_buffer,
-                              VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
-                              1, 1, &markerSet, 0, nullptr);
+      bindModel(spotMarkerIndex(i), textures[0].descriptorSet, 0);
       vkCmdDrawIndexed(fd.command_buffer, static_cast<uint32_t>(indices.size()),
                        1, 0, 0, 0);
     }
@@ -1262,11 +1598,7 @@ void render(const graphics::internal::FrameData& fd) {
       vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &coneVertexBuffer,
                              &lineOffset);
 
-      const VkDescriptorSet coneSet =
-          markerResources[size_t(maxLights) * 2].descriptorSet;
-      vkCmdBindDescriptorSets(fd.command_buffer,
-                              VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
-                              1, 1, &coneSet, 0, nullptr);
+      bindModel(coneIndex(), textures[0].descriptorSet, 0);
       vkCmdDraw(fd.command_buffer, static_cast<uint32_t>(coneVertices.size()),
                 1, 0, 0);
 

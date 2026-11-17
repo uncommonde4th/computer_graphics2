@@ -2,9 +2,11 @@
 
 layout(location = 0) in vec3 fragPosition;
 layout(location = 1) in vec3 fragNormal;
+layout(location = 2) in vec2 fragTexCoord;
 
 layout(location = 0) out vec4 outColor;
 
+// Set 0 - данные сцены
 layout(set = 0, binding = 0) uniform SceneData {
   mat4 viewProjection;
   vec4 cameraPosition;
@@ -37,6 +39,7 @@ layout(std430, set = 0, binding = 2) readonly buffer SpotLights {
 }
 spotLights;
 
+// Set 1 - материал: динамический uniform буфер с данными модели и текстура альбедо
 layout(set = 1, binding = 0) uniform ModelData {
   mat4 model;
   mat4 normalMatrix;
@@ -45,7 +48,17 @@ layout(set = 1, binding = 0) uniform ModelData {
 }
 object;
 
-vec3 blinnPhong(vec3 normal, vec3 viewDir, vec3 lightDir, vec3 radiance) {
+layout(set = 1, binding = 1) uniform sampler2D albedoTexture;
+
+// Push константы: включают нетривиальное сэмплирование для объекта
+layout(push_constant) uniform PushConstants {
+  uint effect;  // 0 - обычное сэмплирование, 1 - нетривиальное
+  float time;
+}
+pc;
+
+vec3 blinnPhong(vec3 normal, vec3 viewDir, vec3 lightDir, vec3 radiance,
+                vec3 albedo) {
   float diffuse = max(dot(normal, lightDir), 0.0);
 
   float specular = 0.0;
@@ -54,24 +67,42 @@ vec3 blinnPhong(vec3 normal, vec3 viewDir, vec3 lightDir, vec3 radiance) {
     specular = pow(max(dot(normal, halfDir), 0.0), object.specular.w);
   }
 
-  return radiance *
-         (object.albedo.rgb * diffuse + object.specular.rgb * specular);
+  return radiance * (albedo * diffuse + object.specular.rgb * specular);
 }
 
 void main() {
-  if (object.specular.w <= 0.0) {
+  // Маркеры источников и конусы рисуются постоянным цветом, без освещения и без текстуры
+  if (object.specular.w == 0.0) {
     outColor = vec4(object.albedo.rgb, 1.0);
     return;
+  }
+
+  vec3 albedo;
+  if (pc.effect != 0u) {
+    // Два сэмпла одной текстуры с разными координатами, которые меняются со временем
+    vec2 uvA = fragTexCoord + vec2(pc.time * 0.1, 0.0);
+    vec2 uvB = fragTexCoord.yx * 2.0 - vec2(0.0, pc.time * 0.15);
+
+    vec3 a = texture(albedoTexture, uvA).rgb;
+    vec3 b = texture(albedoTexture, uvB).rgb;
+
+    albedo = mix(a, b, 0.5 + 0.5 * sin(pc.time));
+
+    // Модуляция цвета, тоже зависит от времени
+    albedo *= 0.6 + 0.4 * vec3(sin(pc.time), sin(pc.time + 2.094),
+                               sin(pc.time + 4.188));
+  } else {
+    albedo = texture(albedoTexture, fragTexCoord).rgb;
   }
 
   vec3 normal = normalize(fragNormal);
   vec3 viewDir = normalize(scene.cameraPosition.xyz - fragPosition);
 
-  vec3 color = scene.ambient.rgb * scene.ambient.w * object.albedo.rgb;
+  vec3 color = scene.ambient.rgb * scene.ambient.w * albedo;
 
   vec3 sunDir = normalize(-scene.sunDirection.xyz);
   color += blinnPhong(normal, viewDir, sunDir,
-                      scene.sunColor.rgb * scene.sunColor.w);
+                      scene.sunColor.rgb * scene.sunColor.w, albedo);
 
   for (int i = 0; i < scene.counts.x; ++i) {
     PointLight light = pointLights.data[i];
@@ -79,10 +110,11 @@ void main() {
     vec3 toLight = light.position.xyz - fragPosition;
     float dist2 = max(dot(toLight, toLight), 0.0001);
     vec3 lightDir = toLight * inversesqrt(dist2);
+
     float attenuation = 1.0 / dist2;
 
     color += blinnPhong(normal, viewDir, lightDir,
-                        light.color.rgb * light.color.w * attenuation);
+                        light.color.rgb * light.color.w * attenuation, albedo);
   }
 
   for (int i = 0; i < scene.counts.y; ++i) {
@@ -91,16 +123,19 @@ void main() {
     vec3 toLight = light.position.xyz - fragPosition;
     float dist2 = max(dot(toLight, toLight), 0.0001);
     vec3 lightDir = toLight * inversesqrt(dist2);
+
     float attenuation = 1.0 / dist2;
 
     float cosAngle = dot(-lightDir, normalize(light.direction.xyz));
     float cosInner = cos(radians(light.cone.x));
     float cosOuter = cos(radians(light.cone.y));
+
     float edge = clamp((cosAngle - cosOuter) / max(cosInner - cosOuter, 0.0001),
                        0.0, 1.0);
 
     color += blinnPhong(normal, viewDir, lightDir,
-                        light.color.rgb * light.color.w * attenuation * edge);
+                        light.color.rgb * light.color.w * attenuation * edge,
+                        albedo);
   }
 
   outColor = vec4(color, 1.0);
